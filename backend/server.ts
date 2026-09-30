@@ -5,6 +5,8 @@ import cors from "cors";
 import sharp from "sharp";
 import Groq from "groq-sdk";
 
+import { validateLatex, type Issue } from "./src/validator";
+
 import { mathjax } from "mathjax-full/js/mathjax.js";
 import { TeX } from "mathjax-full/js/input/tex.js";
 import { SVG } from "mathjax-full/js/output/svg.js";
@@ -67,8 +69,8 @@ function latexToSvg(
     /viewBox="[-\d.]+\s+[-\d.]+\s+([\d.]+)\s+([\d.]+)"/
   );
 
-  const widthUnits = viewBoxMatch ? parseFloat(viewBoxMatch[1]) : 5000;
-  const heightUnits = viewBoxMatch ? parseFloat(viewBoxMatch[2]) : 1000;
+  const widthUnits = viewBoxMatch?.[1] ? parseFloat(viewBoxMatch[1]) : 5000;
+  const heightUnits = viewBoxMatch?.[2] ? parseFloat(viewBoxMatch[2]) : 1000;
 
   const pxPerUnit = fontSizePx / 1000;
 
@@ -239,23 +241,59 @@ alăturate, fără niciun operator inserat.
 
 async function textToLatex(
   text: string,
-  suppressMultiplication = false
+  suppressMultiplication = false,
+  previousIssues: Issue[] = []
 ): Promise<string> {
   const systemPrompt = suppressMultiplication
     ? RULES + NO_MULTIPLICATION_ADDENDUM
     : RULES;
 
+  const messages: { role: "system" | "user"; content: string }[] = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: text },
+  ];
+
+  // Retry inteligent (§21 din brief): la a doua încercare AI-ul primește
+  // eroarea concretă raportată de validator, nu aceeași cerere identică.
+  if (previousIssues.length > 0) {
+    const errors = previousIssues
+      .map((i) => `ERROR: ${i.message}\nRULE: ${i.code}`)
+      .join("\n\n");
+    messages.push({
+      role: "user",
+      content: `Rezultatul anterior a fost respins de validator:\n\n${errors}\n\nREGENERATE respectând regulile. Returnează doar LaTeX.`,
+    });
+  }
+
   const response = await groq.chat.completions.create({
     model: GROQ_MODEL,
     temperature: 0,
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: text },
-    ],
+    messages,
   });
 
   const raw = response.choices[0]?.message?.content || "";
   return cleanLatex(raw);
+}
+
+// AI → validator determinist → (cel mult o reîncercare cu eroarea concretă).
+// Corecțiile sigure (\times → \cdot, \quad, \left\{ etc.) sunt aplicate
+// automat de validator; doar erorile structurale declanșează retry-ul.
+async function convertAndValidate(
+  text: string,
+  suppressMultiplication = false
+) {
+  let issues: Issue[] = [];
+  let validation = validateLatex(text, "");
+  let attempts = 0;
+
+  for (attempts = 1; attempts <= 2; attempts++) {
+    const latex = await textToLatex(text, suppressMultiplication, issues);
+    validation = validateLatex(text, latex);
+    if (validation.status !== "ERROR") break;
+    issues = validation.issues.filter((i) => !i.fix);
+  }
+
+  return { latex: validation.fixedLatex, validation, attempts };
 }
 
 // Aplică \overline / \bf / \it peste LaTeX-ul deja generat.
@@ -298,19 +336,19 @@ app.post("/api/latex", async (req, res) => {
       return res.status(400).json({ error: "Text invalid." });
     }
 
-    const latex = await textToLatex(text);
+    const { latex, validation, attempts } = await convertAndValidate(text);
 
     if (!latex) {
-      return res.status(502).json({ error: "Gemini nu a returnat LaTeX." });
+      return res.status(502).json({ error: "AI-ul nu a returnat LaTeX." });
     }
 
     console.log("INPUT:", text);
-    console.log("LATEX:", latex);
+    console.log("LATEX:", latex, "| validare:", validation.status, "| încercări:", attempts);
 
-    res.json({ latex });
+    return res.json({ latex, validation, attempts });
   } catch (error: any) {
     console.error("GROQ ERROR:", error);
-    res.status(500).json({
+    return res.status(500).json({
       error: error?.message || "Eroare la generarea LaTeX.",
     });
   }
@@ -333,10 +371,19 @@ app.post("/api/render", async (req, res) => {
       return res.status(400).json({ error: "Text invalid." });
     }
 
-    let latex = await textToLatex(text, overline);
+    const converted = await convertAndValidate(text, overline);
+    let latex = converted.latex;
 
     if (!latex) {
-      return res.status(502).json({ error: "Gemini nu a returnat LaTeX." });
+      return res.status(502).json({ error: "AI-ul nu a returnat LaTeX." });
+    }
+
+    if (converted.validation.status === "ERROR") {
+      return res.status(422).json({
+        error: "LaTeX-ul generat nu a trecut validarea.",
+        latex,
+        validation: converted.validation,
+      });
     }
 
     latex = applyStyle(latex, bold, italic, overline);
@@ -358,15 +405,17 @@ app.post("/api/render", async (req, res) => {
 
     const pngDataUrl = await svgToPngDataUrl(rendered.svg);
 
-    res.json({
+    return res.json({
       latex,
       pngDataUrl,
       width: rendered.widthPx,
       height: rendered.heightPx,
+      validation: converted.validation,
+      attempts: converted.attempts,
     });
   } catch (error: any) {
     console.error("RENDER ERROR:", error);
-    res.status(500).json({
+    return res.status(500).json({
       error: error?.message || "Eroare la randare.",
     });
   }
@@ -401,7 +450,7 @@ app.post("/api/render-latex", async (req, res) => {
 
     const pngDataUrl = await svgToPngDataUrl(rendered.svg);
 
-    res.json({
+    return res.json({
       latex,
       pngDataUrl,
       width: rendered.widthPx,
@@ -409,7 +458,7 @@ app.post("/api/render-latex", async (req, res) => {
     });
   } catch (error: any) {
     console.error("RENDER-LATEX ERROR:", error);
-    res.status(500).json({
+    return res.status(500).json({
       error: error?.message || "Eroare la randare.",
     });
   }
