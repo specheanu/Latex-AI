@@ -9,8 +9,50 @@ import {
   Alert,
   Checkbox,
 } from "@canva/app-ui-kit";
-import { selection, addElementAtPoint, getCurrentPageContext } from "@canva/design";
+import {
+  selection,
+  addElementAtPoint,
+  getCurrentPageContext,
+  getDesignToken,
+} from "@canva/design";
 import type { SelectionEvent } from "@canva/design";
+
+// Host-ul backend-ului vine din CANVA_BACKEND_HOST (.env) prin build.
+// Fallback pe localhost pentru dezvoltare fără .env.
+const API_BASE =
+  typeof BACKEND_HOST === "string" && BACKEND_HOST
+    ? BACKEND_HOST
+    : "http://localhost:3001";
+
+type ValidationIssue = {
+  code: string;
+  severity: "error" | "review";
+  message: string;
+  fix?: string;
+};
+
+type ValidationInfo = {
+  status: "OK" | "REVIEW" | "ERROR";
+  issues: ValidationIssue[];
+};
+
+// Cerere către backend cu tokenul Canva (verificat de backend când
+// CANVA_APP_ID e configurat). Dacă tokenul nu poate fi obținut (ex. în
+// preview fără app id), cererea pleacă fără el.
+async function apiPost(path: string, body: unknown): Promise<Response> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  try {
+    const { token } = await getDesignToken();
+    headers.Authorization = `Bearer ${token}`;
+  } catch {
+    // fără token — backend-ul decide dacă acceptă
+  }
+  return fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+}
 
 export function App() {
   const [selectionEvent, setSelectionEvent] =
@@ -26,6 +68,9 @@ export function App() {
   const [preview, setPreview] = useState("");
   const [imgWidth, setImgWidth] = useState(0);
   const [imgHeight, setImgHeight] = useState(0);
+
+  const [validation, setValidation] = useState<ValidationInfo | null>(null);
+  const [confidence, setConfidence] = useState<number | null>(null);
 
   const [loading, setLoading] = useState(false);
   const [inserting, setInserting] = useState(false);
@@ -44,6 +89,8 @@ export function App() {
         setLatex("");
         setPreview("");
         setError("");
+        setValidation(null);
+        setConfidence(null);
 
         if (event.count === 0) {
           setText("");
@@ -70,7 +117,9 @@ export function App() {
       },
     });
 
-    return () => dispose();
+    return () => {
+      if (typeof dispose === "function") dispose();
+    };
   }, []);
 
   const isTextSelected = !!selectionEvent && selectionEvent.count > 0;
@@ -87,17 +136,25 @@ export function App() {
     setError("");
     setLatex("");
     setPreview("");
+    setValidation(null);
+    setConfidence(null);
 
     try {
-      const response = await fetch("http://localhost:3001/api/render", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, fontSize, bold, italic, overline }),
+      const response = await apiPost("/api/render", {
+        text,
+        fontSize,
+        bold,
+        italic,
+        overline,
       });
 
       const data = await response.json();
 
       if (!response.ok) {
+        // 422 de la validator: arătăm LaTeX-ul și problemele, ca să poată fi
+        // corectat manual și re-randat.
+        if (data.latex) setLatex(data.latex);
+        if (data.validation) setValidation(data.validation);
         throw new Error(data.error || "Backend error");
       }
 
@@ -105,6 +162,8 @@ export function App() {
       setPreview(data.pngDataUrl);
       setImgWidth(data.width);
       setImgHeight(data.height);
+      setValidation(data.validation ?? null);
+      setConfidence(typeof data.confidence === "number" ? data.confidence : null);
     } catch (err: any) {
       console.error(err);
       setError(err?.message || "Nu s-a putut genera formula.");
@@ -125,14 +184,7 @@ export function App() {
     setError("");
 
     try {
-      const response = await fetch(
-        "http://localhost:3001/api/render-latex",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ latex, fontSize }),
-        }
-      );
+      const response = await apiPost("/api/render-latex", { latex, fontSize });
 
       const data = await response.json();
 
@@ -284,19 +336,48 @@ export function App() {
 
       {error && <Alert tone="critical">{error}</Alert>}
 
-      {preview && (
+      {(preview || latex) && (
         <>
-          <Text>Formula generată:</Text>
-          <img
-            src={preview}
-            alt={latex}
-            style={{
-              maxWidth: "100%",
-              background: "#ffffff",
-              padding: "8px",
-              borderRadius: "4px",
-            }}
-          />
+          {preview && (
+            <>
+              <Text>Formula generată:</Text>
+              <img
+                src={preview}
+                alt={latex}
+                style={{
+                  maxWidth: "100%",
+                  background: "#ffffff",
+                  padding: "8px",
+                  borderRadius: "4px",
+                }}
+              />
+            </>
+          )}
+
+          {validation && (
+            <Alert
+              tone={
+                validation.status === "OK"
+                  ? "positive"
+                  : validation.status === "REVIEW"
+                    ? "warn"
+                    : "critical"
+              }
+            >
+              Validare: {validation.status}
+              {confidence !== null ? ` · încredere ${confidence.toFixed(2)}` : ""}
+              {validation.issues.length > 0 && (
+                <ul style={{ margin: "6px 0 0 16px", padding: 0 }}>
+                  {validation.issues.map((issue, i) => (
+                    <li key={i}>
+                      {issue.message}
+                      {issue.fix ? ` — ${issue.fix}` : ""}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </Alert>
+          )}
 
           <Text>
             Cod LaTeX (poți edita manual dacă nu e conform cerințelor tale):
