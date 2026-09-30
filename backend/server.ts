@@ -195,6 +195,9 @@ RESPECTĂ STRICT următoarele reguli:
     expresiei ar trebui evidențiată sau accentuată.
 
 20. Pentru paralele se folosește \\parallel.
+21. Ce este cu \\div se modifica in\\frac. sau :, in functie de context.
+22. In cazul in care textul contine ... se va transforma in \\dots
+23. In cazul in care textul contine "\\", se va transforma in \\frac.
 `;
 
 function cleanLatex(raw: string): string {
